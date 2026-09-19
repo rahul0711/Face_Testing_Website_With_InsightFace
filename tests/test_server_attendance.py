@@ -1,0 +1,124 @@
+import tempfile
+import threading
+from pathlib import Path
+from datetime import datetime
+import numpy as np
+import pytest
+from fastapi.testclient import TestClient
+from app.web.auth import DEMO_TOKEN
+from app.web.server import app, _save_custom_cameras, _load_custom_cameras, _sessions, CameraWebSession
+from app.config import CameraConfig, load_config
+from app.processing.pipeline import FacePipeline
+
+
+def test_login_and_token():
+    client = TestClient(app)
+    resp = client.post("/api/login", json={"username": "AIFace", "password": "India@AI"})
+    assert resp.status_code == 200
+    assert resp.json()["token"] == DEMO_TOKEN
+
+
+def test_head_count_source_validation(monkeypatch):
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {DEMO_TOKEN}"}
+
+    # Register a mock session in _sessions
+    cam = CameraConfig(name="Mock Cam", ip="127.0.0.1")
+    lock = threading.Lock()
+    mock_pipeline = type("MockPipeline", (), {"head_count_source": "face"})()
+    mock_session = type("MockSession", (), {
+        "id": "mock-cam",
+        "camera": cam,
+        "head_count_source": "face",
+        "pipeline": mock_pipeline,
+        "_lock": lock,
+    })()
+
+    monkeypatch.setitem(_sessions, "mock-cam", mock_session)
+
+    # Test invalid source rejected with 422
+    resp = client.patch("/api/cameras/mock-cam/head-count-source", json={"source": "invalid_mode"}, headers=headers)
+    assert resp.status_code == 422
+
+    # Test attendance is accepted
+    resp = client.patch("/api/cameras/mock-cam/head-count-source", json={"source": "attendance"}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["head_count_source"] == "attendance"
+    assert mock_session.head_count_source == "attendance"
+    assert mock_pipeline.head_count_source == "attendance"
+
+
+def test_save_sent_image_writes_to_data(tmp_path, monkeypatch):
+    import app.web.server as server_module
+    monkeypatch.setattr(server_module, "_ATTENDANCE_IMAGES_DIR", tmp_path / "attendance")
+    monkeypatch.setattr(server_module, "_RECOGNIZE_IMAGES_DIR", tmp_path / "recognized_faces")
+
+    crop = np.zeros((120, 120, 3), dtype=np.uint8)
+    now = datetime.now()
+
+    # Create dummy CameraConfig
+    cam = CameraConfig(name="Test Cam", ip="127.0.0.1")
+    # Mock class instance method directly
+    session_stub = type("SessionStub", (), {
+        "id": "test-cam",
+        "camera": cam,
+        "_save_sent_image": CameraWebSession._save_sent_image,
+    })()
+
+    path = session_stub._save_sent_image(crop, track_id=42, timestamp=now)
+    assert path is not None
+    assert path.exists()
+    assert "track42" in path.name
+    assert path.parent.name == "test-cam"
+    assert (tmp_path / "recognized_faces" / "test-cam" / path.name).exists()
+
+
+def test_session_attendance_head_count_history():
+    cam = CameraConfig(name="Test Cam", ip="127.0.0.1")
+    minute_key = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lock = threading.Lock()
+    session_stub = type("SessionStub", (), {
+        "id": "test-cam",
+        "camera": cam,
+        "head_count_source": "attendance",
+        "_lock": lock,
+        "_minute_buckets": {
+            minute_key: {
+                "face_sum": 6, "face_samples": 2,
+                "person_sum": 0, "person_samples": 0,
+                "best_sum": 6, "best_samples": 2,
+            }
+        },
+        "head_count_history": CameraWebSession.head_count_history,
+    })()
+
+    history = session_stub.head_count_history()
+    assert len(history) == 1
+    assert history[0]["minute"] == minute_key
+    assert history[0]["avg_faces"] == 3
+
+
+def test_tapo_camera_email_config():
+    cam = CameraConfig(
+        name="Tapo Living Room",
+        ip="192.168.1.50",
+        rtsp_port=554,
+        username="user@example.com",
+        password="tapopassword",
+        rtsp_path="/stream1",
+    )
+    assert cam.rtsp_url == "rtsp://user%40example.com:tapopassword@192.168.1.50:554/stream1"
+    assert "tapopassword" not in cam.rtsp_url_masked
+    assert "***" in cam.rtsp_url_masked
+
+
+def test_test_camera_connection_validation():
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {DEMO_TOKEN}"}
+    resp = client.post(
+        "/api/cameras/test-connection",
+        json={"ip": "", "username": "admin", "password": "123"},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+

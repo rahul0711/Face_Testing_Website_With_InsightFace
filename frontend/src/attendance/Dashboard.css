@@ -1,0 +1,145 @@
+.dashboard {
+  display: grid;
+  grid-template-columns: minmax(320px, 640px) 1fr;
+  grid-template-rows: auto auto;
+  gap: 24px;
+  padding: 24px;
+}
+
+@media (max-width: 1000px) {
+  .dashboard {
+    grid-template-columns: 1fr;
+  }
+}
+
+.dashboard__panel {
+  background: #1c1f26;
+  border-radius: 12px;
+  padding: 20px;
+  color: #e8e8ea;
+}
+
+.dashboard__panel h2 {
+  margin-top: 0;
+  font-size: 1.05rem;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dashboard__live {
+  grid-row: span 2;
+}
+
+.dashboard__ws-status {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.dashboard__ws-status--connected {
+  background: #1f3d2a;
+  color: #7bd88f;
+}
+
+.dashboard__ws-status--connecting {
+  background: #3d381f;
+  color: #e0c96a;
+}
+
+.dashboard__ws-status--disconnected {
+  background: #3d1f1f;
+  color: #ff8080;
+}
+
+.dashboard__live-frame img {
+  width: 100%;
+  border-radius: 8px;
+  display: block;
+}
+
+.dashboard__hint {
+  color: #8a92a6;
+  font-size: 0.9rem;
+}
+
+.dashboard__attendance-list,
+.dashboard__unknown-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 380px;
+  overflow-y: auto;
+}
+
+.dashboard__attendance-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  border: 1px solid #2c303a;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.dashboard__attendance-row img {
+  width: 48px;
+  height: 48px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.dashboard__attendance-info {
+  display: flex;
+  flex-direction: column;
+  font-size: 0.8rem;
+  color: #a9b1c3;
+  gap: 1px;
+}
+
+.dashboard__attendance-info strong {
+  color: #e8e8ea;
+  font-size: 0.9rem;
+}
+
+.dashboard__low-conf {
+  color: #ff9d5c;
+}
+
+.dashboard__unknown-grid {
+  flex-direction: row;
+  flex-wrap: wrap;
+}
+
+.dashboard__unknown-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  width: 100px;
+  border: 1px solid #2c303a;
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.dashboard__unknown-card img {
+  width: 72px;
+  height: 72px;
+  border-radius: 6px;
+  object-fit: cover;
+}
+
+.dashboard__unknown-card button {
+  font-size: 0.7rem;
+  padding: 4px 6px;
+  border-radius: 6px;
+  border: 1px solid #3a3f4b;
+  background: #2a2e38;
+  color: #e8e8ea;
+  cursor: pointer;
+}
+
+.dashboard__unknown-card button:hover {
+  background: #343946;
+}
