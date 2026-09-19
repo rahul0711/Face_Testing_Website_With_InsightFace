@@ -122,3 +122,44 @@ def test_test_camera_connection_validation():
     )
     assert resp.status_code == 422
 
+
+def test_server_cooldown_suppression(monkeypatch, tmp_path):
+    import app.web.server as server_module
+    monkeypatch.setattr(server_module, "_ATTENDANCE_IMAGES_DIR", tmp_path / "attendance")
+    monkeypatch.setattr(server_module, "_RECOGNIZE_IMAGES_DIR", tmp_path / "recognized_faces")
+
+    # Mock recognize_face to return a successful punch
+    monkeypatch.setattr(
+        server_module,
+        "recognize_face",
+        lambda crop: {"success": True, "name": "Alice", "EmployeeId": "E123", "message": "Punch OK"},
+    )
+
+    cam = CameraConfig(name="Test Cam", ip="127.0.0.1")
+    lock = threading.Lock()
+    session_stub = type("SessionStub", (), {
+        "id": "test-cam",
+        "camera": cam,
+        "_lock": lock,
+        "_user_last_punched": {},
+        "_PUNCH_COOLDOWN_S": 600.0,
+        "_recognitions": [],
+        "_MAX_RECOGNITIONS": 50,
+        "_save_sent_image": CameraWebSession._save_sent_image,
+        "_recognize_and_record": CameraWebSession._recognize_and_record,
+    })()
+
+    crop = np.zeros((100, 100, 3), dtype=np.uint8)
+
+    # First punch: image saved, response has original message
+    session_stub._recognize_and_record(crop, track_id=1)
+    assert len(session_stub._recognitions) == 1
+    assert session_stub._recognitions[0]["image_path"] is not None
+    assert session_stub._recognitions[0]["response"]["message"] == "Punch OK"
+
+    # Second punch within cooldown: no image saved, message updated to cooldown notice
+    session_stub._recognize_and_record(crop, track_id=2)
+    assert len(session_stub._recognitions) == 2
+    assert session_stub._recognitions[1]["image_path"] is None
+    assert "done punching" in session_stub._recognitions[1]["response"]["message"]
+

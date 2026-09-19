@@ -196,3 +196,13 @@ BROADCAST_BUFFER_SECONDS=1.2
 # the camera still eventually gets marked present.
 MAX_TRACK_AGE_S=6.0
 
+# Cooldown window in seconds after a person is recognized and punched.
+# During this window (default 600s = 10 minutes), subsequent sightings of this
+# person will NOT save new crop images to disk or insert duplicate DB rows.
+# The dashboard announces/displays: "You're done punching for like X minutes".
+PUNCH_COOLDOWN_SECONDS=600
+
+# Retention window in seconds for storing unknown face crops on disk and in UI.
+# Unrecognized face crops are removed after 30 seconds to prevent disk buildup.
+UNKNOWN_FACE_TTL_SECONDS=30
+

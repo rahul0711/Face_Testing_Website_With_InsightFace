@@ -89,6 +89,15 @@ class AttendanceConfig:
     # with that fix, this number means what it says.
     broadcast_buffer_seconds: float = field(default_factory=lambda: _float("BROADCAST_BUFFER_SECONDS", 1.2))
 
+    # Cooldown period in seconds before a recognized user can punch attendance again.
+    # Defaults to 600 seconds (10 minutes). During this window, repeat visits do not
+    # write new attendance rows or save new crop images to disk.
+    punch_cooldown_seconds: float = field(default_factory=lambda: _float("PUNCH_COOLDOWN_SECONDS", 600.0))
+
+    # Time-to-live in seconds for storing unknown face crops on disk.
+    # Defaults to 30.0 seconds. After 30s, unrecognized face crops are removed.
+    unknown_face_ttl_seconds: float = field(default_factory=lambda: _float("UNKNOWN_FACE_TTL_SECONDS", 30.0))
+
 
 def load_attendance_config() -> AttendanceConfig:
     return AttendanceConfig()

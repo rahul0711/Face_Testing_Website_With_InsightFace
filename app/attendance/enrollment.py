@@ -7,6 +7,7 @@ why that matters.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import uuid
 from dataclasses import dataclass
@@ -233,15 +234,30 @@ def _thumbnail_url_safe(path_str: str) -> str:
 
 
 def list_attendance(date_str: str | None) -> list[dict]:
-    """date_str: 'YYYY-MM-DD', or None for all."""
+    """date_str: 'YYYY-MM-DD', or None for all. Deduplicates entries within the cooldown window."""
     session = get_session()
+    cfg = get_config()
+    cooldown_s = getattr(cfg, "punch_cooldown_seconds", 600.0)
     try:
-        stmt = select(AttendanceEvent)
+        stmt = select(AttendanceEvent).order_by(AttendanceEvent.timestamp.asc())
         events = session.execute(stmt).scalars().all()
         out = []
+        last_seen: dict[int, dt.datetime] = {}
         for e in events:
             if date_str and e.timestamp.strftime("%Y-%m-%d") != date_str:
                 continue
+
+            ts = e.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=dt.timezone.utc)
+
+            # Suppress duplicate punch records within the 10-minute cooldown window
+            if e.user_id in last_seen:
+                prev_ts = last_seen[e.user_id]
+                if (ts - prev_ts).total_seconds() < cooldown_s:
+                    continue
+
+            last_seen[e.user_id] = ts
             out.append({
                 "id": e.id,
                 "user_id": e.user_id,

@@ -24,6 +24,7 @@ import uuid
 import cv2
 import numpy as np
 import supervision as sv
+from sqlalchemy import select
 
 from app.attendance.best_frame import TrackBuffer, TrackBufferStore
 from app.attendance.config import AttendanceConfig
@@ -113,6 +114,78 @@ class RecognitionWorker:
         self._broadcast_lock = threading.Lock()
         self._last_boxes: list[dict] = []
 
+        # Maps user_id -> monotonic timestamp of their most recent punch.
+        # Enforces punch_cooldown_seconds (default 10 min) so repeat detections
+        # do not write duplicate database events or save redundant face crops.
+        self._user_last_punched: dict[int, float] = {}
+        self._cooldown_lock = threading.Lock()
+
+        # Tracks unknown face crop paths with monotonic creation time: (mono_ts, Path).
+        # Expired after unknown_face_ttl_seconds (default 30s) and removed from disk.
+        self._unknown_crops: collections.deque[tuple[float, Path]] = collections.deque()
+        self._unknown_crops_lock = threading.Lock()
+
+    def _cleanup_expired_unknowns(self) -> None:
+        """Removes unknown face crops from disk that have exceeded unknown_face_ttl_seconds (30s)."""
+        now = time.monotonic()
+        to_delete: list[Path] = []
+        with self._unknown_crops_lock:
+            while self._unknown_crops and (now - self._unknown_crops[0][0]) >= self._cfg.unknown_face_ttl_seconds:
+                _, path = self._unknown_crops.popleft()
+                to_delete.append(path)
+
+        for p in to_delete:
+            try:
+                if p.exists():
+                    p.unlink(missing_ok=True)
+                    logger.info("Removed expired unknown face crop (>%0.1fs): %s", self._cfg.unknown_face_ttl_seconds, p.name)
+            except Exception as exc:
+                logger.warning("Failed to delete expired unknown crop %s: %s", p, exc)
+
+    def _cleanup_orphaned_unknowns(self) -> None:
+        """Cleans up any legacy unknown crops on disk older than unknown_face_ttl_seconds on startup."""
+        now = time.time()
+        try:
+            if self._cfg.attendance_crops_dir.exists():
+                for f in self._cfg.attendance_crops_dir.glob("unknown_*.jpg"):
+                    if now - f.stat().st_mtime >= self._cfg.unknown_face_ttl_seconds:
+                        f.unlink(missing_ok=True)
+        except Exception as exc:
+            logger.warning("Error cleaning orphaned unknown crops: %s", exc)
+
+    def _get_last_punch_time(self, user_id: int) -> float | None:
+        """Returns monotonic timestamp of user's last punch, or None if not recent/known."""
+        with self._cooldown_lock:
+            if user_id in self._user_last_punched:
+                return self._user_last_punched[user_id]
+
+        # Check DB on cache miss (e.g. after server restart)
+        session = get_session()
+        try:
+            last_event = session.execute(
+                select(AttendanceEvent)
+                .where(AttendanceEvent.user_id == user_id)
+                .order_by(AttendanceEvent.timestamp.desc())
+                .limit(1)
+            ).scalars().first()
+            if last_event is not None and last_event.timestamp is not None:
+                ts = last_event.timestamp
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=dt.timezone.utc)
+                now_utc = dt.datetime.now(dt.timezone.utc)
+                elapsed_s = (now_utc - ts).total_seconds()
+                if 0 <= elapsed_s <= self._cfg.punch_cooldown_seconds:
+                    mono_ts = time.monotonic() - elapsed_s
+                    with self._cooldown_lock:
+                        self._user_last_punched[user_id] = mono_ts
+                    return mono_ts
+        except Exception:
+            logger.exception("Failed checking last punch time in DB for user %d", user_id)
+        finally:
+            session.close()
+
+        return None
+
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True, name="recognition-worker")
         self._thread.start()
@@ -134,14 +207,21 @@ class RecognitionWorker:
             self._finalize_thread.join(timeout=5)
 
     def _finalize_worker_loop(self) -> None:
+        self._cleanup_orphaned_unknowns()
         while not self._stop_event.is_set():
-            batch = self._finalize_queue.get()
+            try:
+                batch = self._finalize_queue.get(timeout=1.0)
+            except queue.Empty:
+                self._cleanup_expired_unknowns()
+                continue
             if batch is None:
                 continue
             try:
                 self._finalize_batch(batch)
             except Exception:
                 logger.exception("Finalize batch failed for tracks %s", [tid for tid, _ in batch])
+            finally:
+                self._cleanup_expired_unknowns()
 
     def _run(self) -> None:
         app_cfg = load_config()
@@ -267,8 +347,8 @@ class RecognitionWorker:
         if len(ready) > 1:
             logger.info("Batch-finalizing %d tracks in one embed call: ids=%s", len(ready), [tid for tid, _ in ready])
 
-        cfg.attendance_crops_dir.mkdir(parents=True, exist_ok=True)
         now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+        now_mono = time.monotonic()
 
         for (track_id, buf), embedding in zip(ready, embeddings):
             match = self._index.best_match(embedding)
@@ -279,12 +359,47 @@ class RecognitionWorker:
                 f"{match[1]:.3f}" if match else "none", low_conf,
             )
 
-            crop_path = cfg.attendance_crops_dir / f"{uuid.uuid4().hex}.jpg"
-            cv2.imwrite(str(crop_path), buf.best_aligned_crop)
-            thumb_url = f"/data/{crop_path.relative_to(cfg.attendance_crops_dir.parent).as_posix()}"
-
             if match is not None and match[1] >= cfg.match_threshold:
                 user_id, score = match
+                last_punch = self._get_last_punch_time(user_id)
+                if last_punch is not None and (now_mono - last_punch) < cfg.punch_cooldown_seconds:
+                    remaining_s = int(cfg.punch_cooldown_seconds - (now_mono - last_punch))
+                    remaining_m = max(1, (remaining_s + 59) // 60)
+                    session = get_session()
+                    try:
+                        user = session.get(User, user_id)
+                        name = user.name if user else f"User #{user_id}"
+                        emp_id = user.employee_id if user else "?"
+                    finally:
+                        session.close()
+
+                    logger.info(
+                        "User %s (%s, id=%d) recognized but already punched within cooldown window (%ds / %dm remaining). "
+                        "Suppressing punch and crop save.",
+                        name, emp_id, user_id, remaining_s, remaining_m,
+                    )
+                    event_bus.publish({
+                        "type": "cooldown",
+                        "track_id": track_id,
+                        "user_id": user_id,
+                        "name": name,
+                        "employee_id": emp_id,
+                        "message": f"You're done punching for like {remaining_m} minutes",
+                        "spoken_message": f"{name}, you're done punching",
+                        "remaining_seconds": remaining_s,
+                        "remaining_minutes": remaining_m,
+                        "timestamp": now_iso,
+                    })
+                    # DO NOT SAVE CROP IMAGE TO DISK!
+                    # DO NOT SAVE ATTENDANCE TO DATABASE!
+                    continue
+
+                # Not in cooldown -> save crop and write attendance event
+                cfg.attendance_crops_dir.mkdir(parents=True, exist_ok=True)
+                crop_path = cfg.attendance_crops_dir / f"{uuid.uuid4().hex}.jpg"
+                cv2.imwrite(str(crop_path), buf.best_aligned_crop)
+                thumb_url = f"/data/{crop_path.relative_to(cfg.attendance_crops_dir.parent).as_posix()}"
+
                 session = get_session()
                 try:
                     user = session.get(User, user_id)
@@ -299,6 +414,9 @@ class RecognitionWorker:
                     session.add(event)
                     session.commit()
                     session.refresh(event)
+                    with self._cooldown_lock:
+                        self._user_last_punched[user_id] = now_mono
+
                     event_bus.publish({
                         "type": "attendance",
                         "track_id": track_id,
@@ -310,10 +428,19 @@ class RecognitionWorker:
                         "face_width_px": buf.best_face_width_px,
                         "low_confidence": low_conf,
                         "thumbnail_url": thumb_url,
+                        "message": f"Punch recorded for {user.name if user else 'user'}!",
                     })
                 finally:
                     session.close()
             else:
+                # Unknown face -> save temporary crop for enrollment (removed after unknown_face_ttl_seconds)
+                cfg.attendance_crops_dir.mkdir(parents=True, exist_ok=True)
+                crop_path = cfg.attendance_crops_dir / f"unknown_{uuid.uuid4().hex}.jpg"
+                cv2.imwrite(str(crop_path), buf.best_aligned_crop)
+                with self._unknown_crops_lock:
+                    self._unknown_crops.append((now_mono, crop_path))
+                thumb_url = f"/data/{crop_path.relative_to(cfg.attendance_crops_dir.parent).as_posix()}"
+
                 event_bus.publish({
                     "type": "unknown",
                     "track_id": track_id,
@@ -322,14 +449,15 @@ class RecognitionWorker:
                     "low_confidence": low_conf,
                     "best_score": match[1] if match else None,
                     "thumbnail_url": thumb_url,
+                    "ttl_seconds": self._cfg.unknown_face_ttl_seconds,
                 })
 
     # Detection/tracking/embedding all run on the full-res frame -- this cap
     # only shrinks the copy sent to the dashboard, which was previously
     # ~740KB/frame at full 1920x1080 (5.9MB/s at 8fps broadcast rate, enough
     # to make the live view itself feel laggy on top of any camera-side
-    # stall).
-    _BROADCAST_MAX_WIDTH = 960
+    # Scaled to 1280 for high clarity in the expanded 75% camera view layout.
+    _BROADCAST_MAX_WIDTH = 1280
 
     def _enqueue_broadcast_frame(self, image_bgr: np.ndarray, boxes: list[dict]) -> None:
         """Draw + resize + JPEG-encode one frame and bank it in the backlog.

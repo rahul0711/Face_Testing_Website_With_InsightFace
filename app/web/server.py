@@ -198,6 +198,8 @@ class CameraWebSession:
     # track_id -> already sent to /Recognize. Track IDs only ever increase
     # (see SimpleIouTracker), so this never needs to shrink or expire.
     _recognized_track_ids: set = field(default_factory=set, repr=False)
+    _user_last_punched: dict = field(default_factory=dict, repr=False)
+    _PUNCH_COOLDOWN_S: ClassVar[float] = 600.0
     _recognitions: list = field(default_factory=list, repr=False)
     _last_skip_log_time: float = field(default=0.0, repr=False)
     # track_id -> {"crop", "score", "first_seen"} while we're still waiting
@@ -547,9 +549,45 @@ class CameraWebSession:
 
     def _recognize_and_record(self, crop: np.ndarray, track_id: int) -> None:
         timestamp = datetime.now()
-        image_path = self._save_sent_image(crop, track_id, timestamp)
         response = recognize_face(crop)
         logger.info("[%s] /Recognize result for track #%s: %s", self.camera.name, track_id, response)
+
+        # Extract employee identification if matched
+        matched = False
+        user_key = None
+        if isinstance(response, dict):
+            matched = bool(response.get("match") is True or response.get("success") is True)
+            user_key = (
+                response.get("EmployeeId")
+                or response.get("employee_id")
+                or response.get("name")
+                or response.get("EmployeeName")
+                or response.get("employee_name")
+            )
+
+        now_mono = time.monotonic()
+        in_cooldown = False
+        remaining_m = 10
+        if matched and user_key:
+            with self._lock:
+                last_time = self._user_last_punched.get(user_key)
+                if last_time is not None and (now_mono - last_time) < self._PUNCH_COOLDOWN_S:
+                    in_cooldown = True
+                    remaining_m = max(1, int((self._PUNCH_COOLDOWN_S - (now_mono - last_time) + 59) // 60))
+                else:
+                    self._user_last_punched[user_key] = now_mono
+
+        if in_cooldown:
+            logger.info(
+                "[%s] Track #%s matched %s but user is in punch cooldown (%dm remaining). Not saving image.",
+                self.camera.name, track_id, user_key, remaining_m,
+            )
+            response = dict(response)
+            response["message"] = f"You're done punching for like {remaining_m} minutes"
+            image_path = None
+        else:
+            image_path = self._save_sent_image(crop, track_id, timestamp)
+
         event = {
             "id": uuid.uuid4().hex[:12],
             "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
